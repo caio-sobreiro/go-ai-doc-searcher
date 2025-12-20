@@ -1,21 +1,14 @@
 <script lang="ts">
 	import { apiClient } from '$lib/api';
-	import type { SearchResponse, StatsResponse } from '$lib/types';
-	import { onMount } from 'svelte';
+	import type { SearchResponse } from '$lib/types';
+
+	// Receive server-loaded data
+	let { data } = $props();
 
 	let query = $state('');
 	let searchResponse = $state<SearchResponse | null>(null);
-	let stats = $state<StatsResponse | null>(null);
 	let loading = $state(false);
 	let error = $state<string | null>(null);
-
-	onMount(async () => {
-		try {
-			stats = await apiClient.getStats();
-		} catch (err) {
-			console.error('Failed to load stats:', err);
-		}
-	});
 
 	async function handleSearch() {
 		if (!query.trim()) return;
@@ -46,9 +39,9 @@
 	<header class="mb-12 text-center">
 		<h1 class="mb-3 text-5xl font-bold text-gray-900">Documentation Search</h1>
 		<p class="text-lg text-gray-600">Search through documentation using AI-powered RAG</p>
-		{#if stats}
+		{#if data.stats}
 			<p class="mt-2 text-sm text-gray-500">
-				{stats.total_chunks.toLocaleString()} chunks indexed from {stats.total_files.toLocaleString()}
+				{data.stats.total_chunks.toLocaleString()} chunks indexed from {data.stats.total_files.toLocaleString()}
 				files
 			</p>
 		{/if}
