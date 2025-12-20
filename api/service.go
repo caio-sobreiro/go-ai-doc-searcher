@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pgvector/pgvector-go"
 )
@@ -22,6 +23,26 @@ type Service struct {
 	ollamaHost     string
 	embeddingModel string
 	chatModel      string
+}
+
+// SanitizeUTF8 removes invalid UTF-8 sequences from a string
+func SanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	// Convert to valid UTF-8, replacing invalid sequences with �
+	v := make([]rune, 0, len(s))
+	for i, r := range s {
+		if r == utf8.RuneError {
+			_, size := utf8.DecodeRuneInString(s[i:])
+			if size == 1 {
+				// Skip invalid byte
+				continue
+			}
+		}
+		v = append(v, r)
+	}
+	return string(v)
 }
 
 // NewService creates a new Service instance
@@ -220,6 +241,19 @@ func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 				i, len(mdFiles), indexed, failed, skipped)
 		}
 
+		// Get relative path for storage first
+		relPath, _ := filepath.Rel(docsDir, filePath)
+
+		// Check if file is already indexed (skip if so)
+		alreadyIndexed, err := s.repo.IsFileIndexed(ctx, relPath)
+		if err != nil {
+			log.Printf("Failed to check if %s is indexed: %v", relPath, err)
+			// Continue anyway, let ON CONFLICT handle it
+		} else if alreadyIndexed {
+			skipped++
+			continue
+		}
+
 		content, err := os.ReadFile(filePath)
 		if err != nil {
 			log.Printf("Failed to read %s: %v", filePath, err)
@@ -227,16 +261,13 @@ func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 			continue
 		}
 
-		contentStr := string(content)
+		contentStr := SanitizeUTF8(string(content))
 
 		// Skip empty files
 		if len(strings.TrimSpace(contentStr)) == 0 {
 			skipped++
 			continue
 		}
-
-		// Get relative path for storage
-		relPath, _ := filepath.Rel(docsDir, filePath)
 
 		// Clean and chunk the content
 		cleanedContent := CleanMarkdown(contentStr)
@@ -286,6 +317,9 @@ func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 					skipped++
 					continue
 				}
+
+				// Sanitize UTF-8 before embedding and inserting
+				subChunk = SanitizeUTF8(subChunk)
 
 				embedding, err := s.GetEmbedding(subChunk)
 				if err != nil {
