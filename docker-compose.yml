@@ -1,7 +1,6 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: pgvector-db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -17,8 +16,7 @@ services:
       retries: 5
 
   app:
-    build: .
-    container_name: go-vector-app
+    build: ./api
     ports:
       - "8080:8080"
     environment:
@@ -37,6 +35,16 @@ services:
         condition: service_healthy
     volumes:
       - ./documentation:/app/documentation:ro
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      ORIGIN: http://localhost:3000
+      API_URL: http://app:8080
+    depends_on:
+      - app
 
 volumes:
   postgres_data:

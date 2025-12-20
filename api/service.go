@@ -78,13 +78,13 @@ func (s *Service) GenerateAnswer(query string, results []Document) (string, erro
 	// Build context from search results (using FULL content)
 	var contextParts []string
 	for i, result := range results {
-		contextParts = append(contextParts, fmt.Sprintf("Document %d (%s):\n%s", i+1, result.FilePath, result.Content))
+		contextParts = append(contextParts, fmt.Sprintf("Documento %d (%s):\n%s", i+1, result.FilePath, result.Content))
 	}
 	context := strings.Join(contextParts, "\n\n---\n\n")
 
 	// Build prompt
-	systemPrompt := "You are a helpful assistant answering questions based on documentation. Use only the provided context to answer. If the context doesn't contain relevant information, say so."
-	userPrompt := fmt.Sprintf("Context:\n%s\n\nQuestion: %s\n\nAnswer:", context, query)
+	systemPrompt := "Você é um assistente útil respondendo perguntas baseadas em documentação técnica. Use APENAS o contexto fornecido para responder. Mantenha a resposta em português. Se o contexto não contém informação relevante, diga isso claramente."
+	userPrompt := fmt.Sprintf("Contexto:\n%s\n\nPergunta: %s\n\nResposta:", context, query)
 
 	// Call Ollama chat API
 	chatReq := OllamaChatRequest{
@@ -127,12 +127,12 @@ func (s *Service) SummarizeWithLLM(content string) (string, error) {
 		return content, nil
 	}
 
-	prompt := fmt.Sprintf(`Summarize this technical documentation in 3-5 concise sentences. Extract only the key facts, steps, and technical details. Remove all UI instructions, navigation elements, and formatting. Focus on WHAT and HOW, not WHERE to click.
+	prompt := fmt.Sprintf(`Resuma esta documentação técnica em 3-5 frases concisas. Extraia apenas os fatos principais, passos e detalhes técnicos. Remova instruções de UI, elementos de navegação e formatação. Foque no QUE e COMO, não ONDE clicar. IMPORTANTE: Mantenha o idioma original do conteúdo (se o conteúdo está em português, o resumo deve estar em português).
 
-Content:
+Conteúdo:
 %s
 
-Summary (max 500 characters):`, content)
+Resumo (máximo 500 caracteres):`, content)
 
 	chatReq := OllamaChatRequest{
 		Model: s.chatModel,
@@ -248,45 +248,65 @@ func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 		}
 
 		// Index each chunk separately
-		for chunkIdx, chunk := range chunks {
+		chunkIdx := 0
+		for _, chunk := range chunks {
 			chunk = strings.TrimSpace(chunk)
 			if len(chunk) < 50 { // Skip tiny chunks
 				skipped++
 				continue
 			}
 
-			// Use LLM to summarize/clean the chunk if it's substantial
+			// First, try to summarize if the chunk is large
+			// This usually condenses 2000 chars → 400-500 chars, fitting in one embedding
+			processedChunk := chunk
 			if len(chunk) > 500 {
 				summarized, err := s.SummarizeWithLLM(chunk)
 				if err == nil && len(summarized) > 0 && len(summarized) < len(chunk) {
-					chunk = summarized
+					processedChunk = summarized
+					log.Printf("✂️  Summarized %s chunk %d: %d → %d chars", relPath, chunkIdx, len(chunk), len(summarized))
+				} else if err != nil {
+					log.Printf("⚠️  Summarization failed for %s chunk %d (len=%d), will split instead", relPath, chunkIdx, len(chunk))
 				}
 			}
 
-			// Final safety check for embedding model limits
-			if len(chunk) > 900 {
-				chunk = chunk[:900]
+			// Only split if summarization failed OR result is still too large
+			// Most summarized chunks (~400 chars) won't need splitting
+			maxChunkSize := 512
+			overlap := 100
+			subChunks := splitIntoSubChunks(processedChunk, maxChunkSize, overlap)
+
+			if len(subChunks) > 1 {
+				log.Printf("📦 Split %s chunk %d (%d chars) into %d sub-chunks", relPath, chunkIdx, len(processedChunk), len(subChunks))
 			}
 
-			embedding, err := s.GetEmbedding(chunk)
-			if err != nil {
-				if strings.Contains(err.Error(), "context length") {
-					log.Printf("Chunk %d too long for %s, skipping chunk", chunkIdx, relPath)
+			// Index each sub-chunk (usually just 1 if summarization worked)
+			for subIdx, subChunk := range subChunks {
+				subChunk = strings.TrimSpace(subChunk)
+				if len(subChunk) < 30 {
 					skipped++
-				} else {
-					log.Printf("Failed to get embedding for %s chunk %d: %v", relPath, chunkIdx, err)
-					failed++
+					continue
 				}
-				continue
-			}
 
-			if err := s.repo.InsertDocument(ctx, relPath, chunkIdx, chunk, embedding); err != nil {
-				log.Printf("Failed to insert %s chunk %d: %v", relPath, chunkIdx, err)
-				failed++
-				continue
-			}
+				embedding, err := s.GetEmbedding(subChunk)
+				if err != nil {
+					log.Printf("⚠️  Embedding failed for %s chunk %d.%d (len=%d): %v", relPath, chunkIdx, subIdx, len(subChunk), err)
+					if strings.Contains(err.Error(), "context length") {
+						skipped++
+					} else {
+						failed++
+					}
+					continue
+				}
 
-			indexed++
+				if err := s.repo.InsertDocument(ctx, relPath, chunkIdx, subChunk, embedding); err != nil {
+					log.Printf("Failed to insert %s chunk %d.%d: %v", relPath, chunkIdx, subIdx, err)
+					failed++
+					continue
+				}
+
+				indexed++
+				chunkIdx++
+			}
 		}
 	}
 
@@ -456,6 +476,31 @@ func ChunkByHeaders(content string, maxChunkSize int) []string {
 	// Don't forget the last chunk
 	if len(currentChunk) > 0 {
 		chunks = append(chunks, strings.Join(currentChunk, "\n"))
+	}
+
+	return chunks
+}
+
+// splitIntoSubChunks splits a string into smaller chunks with overlap
+func splitIntoSubChunks(text string, maxSize int, overlap int) []string {
+	if len(text) <= maxSize {
+		return []string{text}
+	}
+
+	var chunks []string
+	step := maxSize - overlap
+
+	for i := 0; i < len(text); i += step {
+		end := i + maxSize
+		if end > len(text) {
+			end = len(text)
+		}
+		chunks = append(chunks, text[i:end])
+
+		// If this chunk reaches the end, we're done
+		if end == len(text) {
+			break
+		}
 	}
 
 	return chunks
