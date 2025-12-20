@@ -1,28 +1,31 @@
 # Documentation Search with RAG
 
-A full-stack application for searching documentation using AI-powered RAG (Retrieval-Augmented Generation) with local LLM models.
+A full-stack RAG (Retrieval-Augmented Generation) application for searching Portuguese technical documentation using local LLMs. Features server-side rendering, intelligent chunking, and vector similarity search.
 
 ## Features
 
 - 🚀 **Local LLMs** - Uses Ollama for embeddings and chat (no API keys needed!)
 - 🔍 **Semantic Search** - Vector similarity search using PostgreSQL and pgvector
-- 🤖 **AI Answers** - Get contextual answers from your documentation using RAG
-- 📄 **Document Processing** - Markdown cleaning, chunking, and LLM-based summarization
-- 🎨 **Modern UI** - Clean SvelteKit interface with real-time search
+- 🤖 **AI Answers** - Get contextual answers in Portuguese from your documentation
+- 📄 **Smart Processing** - LLM summarization before chunking to preserve context
+- 🎨 **Modern SSR UI** - SvelteKit with server-side rendering
 - 🐳 **Fully Containerized** - Docker Compose setup for easy deployment
 - 💻 **Runs Offline** - Everything local after initial model downloads
+- 🔄 **Resume-Safe Indexing** - Gracefully handles restarts during indexing
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │   SvelteKit UI  │────▶│   Go API Server  │────▶│   PostgreSQL    │
-│  (Port 5173)    │     │   (Port 8080)    │     │   + pgvector    │
+│  SSR (Port 8080)│     │  (Internal only) │     │   + pgvector    │
+│   proxies /api  │     │                  │     │                 │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
                                │
                                ▼
                         ┌──────────────┐
                         │    Ollama    │
+                        │  (Host OS)   │
                         │  Embeddings  │
                         │     Chat     │
                         └──────────────┘
@@ -30,9 +33,9 @@ A full-stack application for searching documentation using AI-powered RAG (Retri
 
 ### Components
 
-- **Frontend** (`frontend/`) - SvelteKit UI with Tailwind CSS
-- **API** (`api/`) - Go backend with RAG implementation
-- **Database** - PostgreSQL 16 with pgvector extension
+- **Frontend** (`frontend/`) - SvelteKit UI with SSR, Tailwind CSS, and API proxy
+- **API** (`api/`) - Go backend with RAG implementation and UTF-8 sanitization
+- **Database** - PostgreSQL 16 with pgvector extension (384-dimensional vectors)
 - **LLM** - Ollama with all-minilm (embeddings) and llama3.2:3b (chat)
 
 ## Quick Start
@@ -43,42 +46,53 @@ A full-stack application for searching documentation using AI-powered RAG (Retri
    ollama pull llama3.2:3b
    ```
 
-2. **Start the backend**:
+2. **Add your documentation**:
    ```bash
-   cd api
+   # Place markdown files in documentation/ directory
+   cp -r /path/to/your/docs documentation/
+   ```
+
+3. **Start everything**:
+   ```bash
    docker compose up --build -d
    ```
 
-3. **Start the frontend**:
-   ```bash
-   cd frontend
-   npm install
-   npm run dev
-   ```
+4. **Access the UI**: [http://localhost:8080](http://localhost:8080)
 
-4. **Open the UI**: [http://localhost:5173](http://localhost:5173)
+The system will automatically index your documentation on startup. Check progress:
+```bash
+docker logs go-pg-vector-app-1 -f
+```
 
 ## How It Works
 
 ### 1. Document Indexing
 
-The system indexes markdown documentation with the following pipeline:
+The system indexes markdown documentation with an optimized pipeline:
 
 ```
 Markdown Files
+  ↓
+UTF-8 Sanitization (remove invalid bytes)
   ↓
 Clean (remove metadata, images, breadcrumbs)
   ↓
 Chunk by headers (~2000 chars)
   ↓
-Summarize with LLM (if >500 chars)
+LLM Summarize (condense to ~400-800 chars, preserves Portuguese)
   ↓
-Truncate to 900 chars (model limit)
+Split if still >512 chars (512 char chunks, 100 char overlap)
   ↓
 Generate embedding (384 dims)
   ↓
-Store in PostgreSQL
+Store in PostgreSQL (with UNIQUE constraint on file_path + chunk_index)
 ```
+
+**Key Features:**
+- Summarizes BEFORE splitting to preserve context
+- Skips already-indexed files on restart (resume-safe)
+- Handles UTF-8 encoding issues gracefully
+- Portuguese-optimized prompts
 
 ### 2. Search & RAG
 
@@ -87,18 +101,24 @@ When a user searches:
 ```
 User Query
   ↓
-Generate embedding
+Generate embedding (384 dims)
   ↓
 Vector similarity search (cosine distance)
   ↓
-Retrieve top N documents (with full content)
+Find top 3 most relevant FILES (not just chunks)
   ↓
-Build context prompt
+Retrieve ALL chunks for each file
   ↓
-LLM generates answer
+Reconstruct complete files
   ↓
-Return answer + source documents
+Build context prompt in Portuguese
+  ↓
+LLM generates answer in Portuguese
+  ↓
+Return answer + source files
 ```
+
+**Context Strategy:** Instead of feeding individual chunks, the system retrieves the top 3 most relevant complete files, providing better context for the LLM.
 
 ## Project Structure
 
@@ -119,8 +139,10 @@ Return answer + source documents
 │   │   │   ├── api.ts    # API client
 │   │   │   └── types.ts  # TypeScript types
 │   │   └── routes/
-│   │       └── +page.svelte  # Main search page
-│   └── vite.config.ts    # Vite config with proxy
+│   │       ├── +page.svelte       # Main search page
+│   │       └── +page.server.ts    # SSR load function
+│   ├── vite.config.ts    # Vite config with API proxy
+│   └── Dockerfile        # Frontend container (dev mode)
 │
 ├── documentation/         # Your markdown docs (to be indexed)
 └── docker-compose.yml    # Container orchestration
@@ -175,7 +197,23 @@ Database statistics (total chunks and files indexed)
 
 ## Development
 
-### Backend (Go)
+### Full Stack (Recommended)
+
+```bash
+# Start all services (postgres, api, frontend)
+docker compose up --build -d
+
+# View logs
+docker logs go-pg-vector-app-1 -f      # API logs
+docker logs go-pg-vector-frontend-1 -f  # Frontend logs
+
+# Stop all services
+docker compose down
+```
+
+Access at: [http://localhost:8080](http://localhost:8080)
+
+### Backend Only (Go)
 
 ```bash
 cd api
@@ -189,7 +227,7 @@ export OLLAMA_HOST=http://localhost:11434
 go run *.go
 ```
 
-### Frontend (SvelteKit)
+### Frontend Only (SvelteKit)
 
 ```bash
 cd frontend
@@ -197,13 +235,15 @@ cd frontend
 # Install dependencies
 npm install
 
-# Development server
+# Development server (with HMR)
 npm run dev
 
 # Production build
 npm run build
 npm run preview
 ```
+
+**Note:** Frontend proxies `/api` requests to backend at `http://localhost:8080` in dev mode.
 
 ## Configuration
 
@@ -226,17 +266,30 @@ DOCS_DIR=/app/documentation
 ### Frontend (.env in frontend/)
 
 ```env
-VITE_API_URL=/api  # Proxy to backend during dev
+# API proxy configuration (handled by Vite)
+API_URL=http://app:8080  # Internal Docker network
+ORIGIN=http://localhost:8080  # Public URL
 ```
+
+**SSR Note:** The frontend uses SvelteKit's server-side rendering to fetch stats before rendering, eliminating the initial API call from the browser.
 
 ## Adding Your Documentation
 
 1. Place markdown files in `documentation/` directory
-2. Restart the API - it will automatically index on startup
+2. Restart the API - it will automatically index on startup:
+   ```bash
+   docker compose restart app
+   ```
 3. Check indexing progress in logs:
    ```bash
-   docker logs go-vector-app -f
+   docker logs go-pg-vector-app-1 -f
    ```
+
+**Indexing Features:**
+- Automatically skips already-indexed files on restart
+- Handles UTF-8 encoding errors gracefully
+- Shows progress every 100 files
+- Displays summary statistics when complete
 
 ## Tech Stack
 
@@ -247,11 +300,11 @@ VITE_API_URL=/api  # Proxy to backend during dev
 - **Ollama** - Local LLM inference
 
 ### Frontend
-- **SvelteKit 2** - Web framework
+- **SvelteKit 2** - Web framework with SSR
 - **Svelte 5** - UI with runes
 - **TypeScript** - Type safety
 - **Tailwind CSS 4** - Styling
-- **Vite 7** - Build tool
+- **Vite 7** - Build tool with API proxy
 
 ## Why Local LLMs?
 
@@ -264,9 +317,12 @@ VITE_API_URL=/api  # Proxy to backend during dev
 ## Performance
 
 - **Indexing**: ~1,300 markdown files → ~2,300 chunks in ~10-15 minutes
-- **Search**: <1 second for embedding + retrieval
+  - Summarization: ~3-5 seconds per chunk
+  - Handles restarts gracefully (skips already-indexed files)
+- **Search**: <1 second for embedding + vector similarity search
 - **Answer Generation**: 2-5 seconds depending on context size
 - **Memory**: ~2GB for llama3.2:3b model
+- **Database**: UNIQUE constraint prevents duplicates, vector index for fast search
 
 ## License
 
