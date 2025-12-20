@@ -53,32 +53,54 @@ func (s *APIServer) HandleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Perform similarity search
-	results, err := s.repo.SimilaritySearch(ctx, queryEmbedding, req.Limit)
+	// Perform similarity search - gets best chunk per file
+	topFiles, err := s.repo.SimilaritySearch(ctx, queryEmbedding, req.Limit)
 	if err != nil {
 		log.Printf("Search failed: %v", err)
 		http.Error(w, "Search failed", http.StatusInternalServerError)
 		return
 	}
 
-	// Generate answer using LLM (with FULL content)
+	// For each top file, get all chunks to reconstruct the complete file
+	var completeFiles []Document
+	var searchResults []SearchResult
+
+	for _, topFile := range topFiles {
+		// Get all chunks for this file
+		allChunks, err := s.repo.GetAllChunksForFile(ctx, topFile.FilePath)
+		if err != nil {
+			log.Printf("Failed to get chunks for %s: %v", topFile.FilePath, err)
+			continue
+		}
+
+		// Reconstruct complete file by joining all chunks
+		var fullContent string
+		for _, chunk := range allChunks {
+			fullContent += chunk.Content + "\n\n"
+		}
+
+		// Add complete file for LLM context
+		completeFiles = append(completeFiles, Document{
+			FilePath: topFile.FilePath,
+			Content:  fullContent,
+		})
+
+		// Add to search results (with truncated content for display)
+		searchResults = append(searchResults, SearchResult{
+			FilePath:   topFile.FilePath,
+			ChunkIndex: 0, // Showing full file, not a specific chunk
+			Content:    Truncate(fullContent, 200),
+		})
+	}
+
+	// Generate answer using LLM with COMPLETE files as context
 	answer := ""
-	if len(results) > 0 {
+	if len(completeFiles) > 0 {
 		var err error
-		answer, err = s.service.GenerateAnswer(req.Query, results)
+		answer, err = s.service.GenerateAnswer(req.Query, completeFiles)
 		if err != nil {
 			log.Printf("Failed to generate answer: %v", err)
 			// Continue without answer rather than failing completely
-		}
-	}
-
-	// Convert to API response (with truncated content for display)
-	searchResults := make([]SearchResult, len(results))
-	for i, doc := range results {
-		searchResults[i] = SearchResult{
-			FilePath:   doc.FilePath,
-			ChunkIndex: doc.ChunkIndex,
-			Content:    Truncate(doc.Content, 200),
 		}
 	}
 
