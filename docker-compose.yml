@@ -17,8 +17,7 @@ services:
 
   app:
     build: ./api
-    ports:
-      - "8080:8080"
+    # Port not exposed - accessed via frontend proxy only
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -39,9 +38,9 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3000:3000"
+      - "8080:3000"
     environment:
-      ORIGIN: http://localhost:3000
+      ORIGIN: http://localhost:8080
       API_URL: http://app:8080
     depends_on:
       - app
