@@ -35,7 +35,8 @@ func (r *Repository) InitDB(ctx context.Context, vectorDimensions string) error 
 			file_path TEXT NOT NULL,
 			chunk_index INT NOT NULL DEFAULT 0,
 			content TEXT NOT NULL,
-			embedding vector(%s) NOT NULL
+			embedding vector(%s) NOT NULL,
+			UNIQUE(file_path, chunk_index)
 		)
 	`, vectorDimensions)
 	if _, err := r.pool.Exec(ctx, query); err != nil {
@@ -71,11 +72,22 @@ func (r *Repository) RegisterVectorTypes(ctx context.Context) error {
 	return nil
 }
 
-// InsertDocument inserts a document chunk into the database
+// InsertDocument inserts a document chunk into the database (skips if already exists)
 func (r *Repository) InsertDocument(ctx context.Context, filePath string, chunkIndex int, content string, embedding pgvector.Vector) error {
-	query := "INSERT INTO documents (file_path, chunk_index, content, embedding) VALUES ($1, $2, $3, $4)"
+	query := `
+		INSERT INTO documents (file_path, chunk_index, content, embedding)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (file_path, chunk_index) DO NOTHING
+	`
 	_, err := r.pool.Exec(ctx, query, filePath, chunkIndex, content, embedding)
 	return err
+}
+
+// IsFileIndexed checks if a file has already been indexed
+func (r *Repository) IsFileIndexed(ctx context.Context, filePath string) (bool, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM documents WHERE file_path = $1", filePath).Scan(&count)
+	return count > 0, err
 }
 
 // SimilaritySearch performs a vector similarity search
@@ -115,6 +127,33 @@ func (r *Repository) SimilaritySearch(ctx context.Context, queryEmbedding pgvect
 	}
 
 	return results, rows.Err()
+}
+
+// GetAllChunksForFile retrieves all chunks for a specific file, ordered by chunk_index
+func (r *Repository) GetAllChunksForFile(ctx context.Context, filePath string) ([]Document, error) {
+	query := `
+		SELECT id, file_path, chunk_index, content
+		FROM documents
+		WHERE file_path = $1
+		ORDER BY chunk_index
+	`
+
+	rows, err := r.pool.Query(ctx, query, filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chunks []Document
+	for rows.Next() {
+		var doc Document
+		if err := rows.Scan(&doc.ID, &doc.FilePath, &doc.ChunkIndex, &doc.Content); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, doc)
+	}
+
+	return chunks, rows.Err()
 }
 
 // GetStats returns database statistics
