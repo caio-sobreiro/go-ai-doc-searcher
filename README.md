@@ -61,7 +61,7 @@ A full-stack RAG (Retrieval-Augmented Generation) application for searching Port
 
 The system will automatically index your documentation on startup. Check progress:
 ```bash
-docker logs go-pg-vector-app-1 -f
+docker compose logs app -f
 ```
 
 ## How It Works
@@ -204,8 +204,8 @@ Database statistics (total chunks and files indexed)
 docker compose up --build -d
 
 # View logs
-docker logs go-pg-vector-app-1 -f      # API logs
-docker logs go-pg-vector-frontend-1 -f  # Frontend logs
+docker compose logs app -f      # API logs
+docker compose logs frontend -f  # Frontend logs
 
 # Stop all services
 docker compose down
@@ -282,7 +282,7 @@ ORIGIN=http://localhost:8080  # Public URL
    ```
 3. Check indexing progress in logs:
    ```bash
-   docker logs go-pg-vector-app-1 -f
+   docker compose logs app -f
    ```
 
 **Indexing Features:**
