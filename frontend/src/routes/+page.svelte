@@ -110,21 +110,33 @@
 				<div class="space-y-4">
 					{#each searchResponse.results as result, i}
 						<div class="rounded-lg border border-gray-200 bg-white p-5 shadow-sm transition hover:shadow-md">
-							<div class="mb-2 flex items-start justify-between">
-								<div class="flex items-center">
-									<span
-										class="mr-3 flex h-8 w-8 items-center justify-center rounded-full bg-blue-100 text-sm font-semibold text-blue-800"
-									>
-										{i + 1}
-									</span>
-									<div>
-										<h3 class="font-medium text-gray-900">{result.file_path}</h3>
-										<p class="text-sm text-gray-500">Chunk {result.chunk_index}</p>
-									</div>
+						<div class="mb-2 flex items-start justify-between">
+							<div class="flex items-center">
+								<span
+									class="mr-3 flex h-8 w-8 items-center justify-center rounded-full bg-blue-100 text-sm font-semibold text-blue-800"
+								>
+									{i + 1}
+								</span>
+								<div>
+									<h3 class="font-medium text-gray-900">{result.file_path}</h3>
+									<p class="text-sm text-gray-500">Chunk {result.chunk_index}</p>
 								</div>
 							</div>
-							<p class="mt-3 text-gray-700">{result.content}</p>
+							{#if result.distance !== undefined}
+								<span
+									class="ml-2 shrink-0 rounded-full px-2 py-0.5 text-xs font-medium {result.distance < 0.2
+										? 'bg-green-100 text-green-800'
+										: result.distance < 0.3
+											? 'bg-yellow-100 text-yellow-800'
+											: 'bg-red-100 text-red-800'}"
+									title="Cosine distance (lower = more relevant)"
+								>
+									{(1 - result.distance).toFixed(2)} relevance
+								</span>
+							{/if}
 						</div>
+						<p class="mt-3 text-gray-700">{result.content}</p>
+					</div>
 					{/each}
 				</div>
 			</div>

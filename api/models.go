@@ -9,12 +9,14 @@ type Document struct {
 	ChunkIndex int
 	Content    string
 	Embedding  pgvector.Vector
+	Distance   float64 // cosine distance from query (lower = more relevant)
 }
 
 // OllamaEmbeddingRequest is the request payload for Ollama embeddings API
 type OllamaEmbeddingRequest struct {
 	Model  string `json:"model"`
 	Prompt string `json:"prompt"`
+	Input  string `json:"input,omitempty"` // nomic-embed-text uses "input" field
 }
 
 // OllamaEmbeddingResponse is the response from Ollama embeddings API
@@ -24,9 +26,11 @@ type OllamaEmbeddingResponse struct {
 
 // OllamaChatRequest is the request payload for Ollama chat API
 type OllamaChatRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model    string         `json:"model"`
+	Messages []ChatMessage  `json:"messages"`
+	Stream   bool           `json:"stream"`
+	Think    bool           `json:"think"`             // qwen3: disable chain-of-thought to avoid <think> token leakage
+	Options  map[string]any `json:"options,omitempty"` // e.g. {"num_predict": 120}
 }
 
 // ChatMessage represents a single message in a chat conversation
@@ -55,9 +59,10 @@ type SearchResponse struct {
 
 // SearchResult represents a single search result
 type SearchResult struct {
-	FilePath   string `json:"file_path"`
-	ChunkIndex int    `json:"chunk_index"`
-	Content    string `json:"content"`
+	FilePath   string  `json:"file_path"`
+	ChunkIndex int     `json:"chunk_index"`
+	Content    string  `json:"content"`
+	Distance   float64 `json:"distance"` // cosine distance: lower = more relevant
 }
 
 // StatsResponse contains database statistics

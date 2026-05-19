@@ -25,9 +25,9 @@ services:
       DB_PASSWORD: postgres
       DB_NAME: vectordb
       OLLAMA_HOST: http://host.docker.internal:11434
-      EMBEDDING_MODEL: all-minilm
-      CHAT_MODEL: llama3.2:3b
-      VECTOR_DIMENSIONS: 384
+      EMBEDDING_MODEL: nomic-embed-text
+      CHAT_MODEL: qwen3:14b
+      VECTOR_DIMENSIONS: 768
       API_PORT: 8080
     depends_on:
       postgres:
@@ -38,7 +38,7 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "8080:3000"
+      - "8081:3000"
     environment:
       ORIGIN: http://localhost:8080
       API_URL: http://app:8080

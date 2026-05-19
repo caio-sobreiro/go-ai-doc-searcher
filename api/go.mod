@@ -1,4 +1,4 @@
-module github.com/caio/go-pg-vector
+module github.com/caio/docs-rag
 
 go 1.23.0
 

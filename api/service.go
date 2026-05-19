@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -55,11 +57,23 @@ func NewService(repo *Repository, ollamaHost, embeddingModel, chatModel string) 
 	}
 }
 
-// GetEmbedding retrieves an embedding vector from Ollama
+// OllamaEmbedRequest is the payload for the newer /api/embed endpoint (works for all models)
+type OllamaEmbedRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
+}
+
+// OllamaEmbedResponse is the response from /api/embed
+type OllamaEmbedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+}
+
+// GetEmbedding retrieves an embedding vector from Ollama using the /api/embed endpoint.
+// This endpoint is supported by all modern Ollama models including nomic-embed-text.
 func (s *Service) GetEmbedding(text string) (pgvector.Vector, error) {
-	reqBody := OllamaEmbeddingRequest{
-		Model:  s.embeddingModel,
-		Prompt: text,
+	reqBody := OllamaEmbedRequest{
+		Model: s.embeddingModel,
+		Input: text,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -68,7 +82,7 @@ func (s *Service) GetEmbedding(text string) (pgvector.Vector, error) {
 	}
 
 	resp, err := http.Post(
-		s.ollamaHost+"/api/embeddings",
+		s.ollamaHost+"/api/embed",
 		"application/json",
 		bytes.NewBuffer(jsonData),
 	)
@@ -79,42 +93,130 @@ func (s *Service) GetEmbedding(text string) (pgvector.Vector, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return pgvector.Vector{}, fmt.Errorf("ollama API error: %s", string(body))
+		return pgvector.Vector{}, fmt.Errorf("ollama embed API error: %s", string(body))
 	}
 
-	var embedResp OllamaEmbeddingResponse
+	var embedResp OllamaEmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
 		return pgvector.Vector{}, err
 	}
 
-	if len(embedResp.Embedding) == 0 {
+	if len(embedResp.Embeddings) == 0 || len(embedResp.Embeddings[0]) == 0 {
 		return pgvector.Vector{}, fmt.Errorf("no embeddings returned")
 	}
 
-	return pgvector.NewVector(embedResp.Embedding), nil
+	return pgvector.NewVector(embedResp.Embeddings[0]), nil
 }
 
-// GenerateAnswer generates an answer using the LLM based on search results
+// confluenceIDSuffix matches trailing Confluence numeric IDs like "_1414496257"
+var confluenceIDSuffix = regexp.MustCompile(`_\d{6,}$`)
+
+// filePathToTitle converts a relative file path to a human-readable document title.
+// It URL-decodes path components, strips Confluence numeric suffixes, and replaces hyphens with spaces.
+// Example: "Confluence-Legacy/TSHOOTING/Falha-ao-enviar-todos-os-estudos_1930133656.md" → "Falha ao enviar todos os estudos"
+func filePathToTitle(filePath string) string {
+	base := filepath.Base(filePath)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+
+	// URL-decode (%2D → -, %7C → |, etc.)
+	if decoded, err := url.PathUnescape(name); err == nil {
+		name = decoded
+	}
+
+	// Strip Confluence export numeric suffix (e.g. "_1930133656")
+	name = confluenceIDSuffix.ReplaceAllString(name, "")
+
+	// Replace separators with spaces
+	name = strings.NewReplacer("-", " ", "_", " ").Replace(name)
+
+	return strings.TrimSpace(name)
+}
+
+// GenerateHypotheticalAnswer uses the LLM to produce a short hypothetical document fragment
+// that would answer the query. This HyDE (Hypothetical Document Embeddings) technique
+// generates a vector that is semantically closer to actual documentation than the raw query.
+// Falls back gracefully: caller uses raw query if this returns an error.
+func (s *Service) GenerateHypotheticalAnswer(ctx context.Context, query string) (string, error) {
+	prompt := fmt.Sprintf(`Você é um especialista em sistemas PACS/RIS de imagem médica.
+Gere 2-3 frases técnicas em português que um documento de documentação interna conteria para responder à pergunta abaixo.
+Use terminologia técnica específica: nomes de sistemas (Orthanc, Mirth, PACS, ArgoCD, GitLab), caminhos de arquivo, comandos, nomes de configuração.
+Seja direto — escreva como se fosse um trecho de documentação, não uma explicação.
+
+Pergunta: %s
+
+Trecho hipotético:`, query)
+
+	chatReq := OllamaChatRequest{
+		Model:    s.chatModel,
+		Messages: []ChatMessage{{Role: "user", Content: prompt}},
+		Stream:   false,
+		Think:    false,
+		Options:  map[string]any{"num_predict": 150},
+	}
+
+	reqBody, err := json.Marshal(chatReq)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.ollamaHost+"/api/chat", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ollama API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp OllamaChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(chatResp.Message.Content), nil
+}
+
+// GenerateAnswer generates an answer using the LLM based on retrieved chunks
 func (s *Service) GenerateAnswer(query string, results []Document) (string, error) {
-	// Build context from search results (using FULL content)
+	// Build context from the most relevant chunks
 	var contextParts []string
 	for i, result := range results {
-		contextParts = append(contextParts, fmt.Sprintf("Documento %d (%s):\n%s", i+1, result.FilePath, result.Content))
+		contextParts = append(contextParts, fmt.Sprintf("[Fonte %d: %s]\n%s", i+1, result.FilePath, result.Content))
 	}
 	context := strings.Join(contextParts, "\n\n---\n\n")
 
-	// Build prompt
-	systemPrompt := "Você é um assistente útil respondendo perguntas baseadas em documentação técnica. Use APENAS o contexto fornecido para responder. Mantenha a resposta em português. Se o contexto não contém informação relevante, diga isso claramente."
-	userPrompt := fmt.Sprintf("Contexto:\n%s\n\nPergunta: %s\n\nResposta:", context, query)
+	systemPrompt := `Você é um assistente que responde perguntas técnicas SOMENTE com base nos documentos fornecidos.
 
-	// Call Ollama chat API
+PROCESSO OBRIGATÓRIO:
+1. Leia o contexto fornecido.
+2. Verifique se os documentos respondem a pergunta de forma DIRETA e EXPLÍCITA.
+3. Se SIM: responda usando apenas o que está textualmente nos documentos. Cite [Fonte N].
+4. Se NÃO (contexto irrelevante ou insuficiente): escreva APENAS "Não encontrei essa informação na documentação disponível." — nada mais.
+
+PROIBIDO: inventar procedimentos, usar conhecimento geral, inferir etapas não documentadas.`
+
+	userPrompt := fmt.Sprintf("Documentos:\n%s\n\n---\nPergunta: %s\n\nResposta (baseada EXCLUSIVAMENTE nos documentos acima):", context, query)
+
+	// Call Ollama chat API with think:false to suppress qwen3 reasoning tokens.
+	// temperature:0 reduces creativity and hallucination — we want grounded answers.
 	chatReq := OllamaChatRequest{
 		Model: s.chatModel,
 		Messages: []ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
-		Stream: false,
+		Stream:  false,
+		Think:   false,
+		Options: map[string]any{"temperature": 0.0, "num_predict": 800},
 	}
 
 	reqBody, err := json.Marshal(chatReq)
@@ -141,76 +243,9 @@ func (s *Service) GenerateAnswer(query string, results []Document) (string, erro
 	return chatResp.Message.Content, nil
 }
 
-// SummarizeWithLLM summarizes content using the LLM
-func (s *Service) SummarizeWithLLM(content string) (string, error) {
-	// If content is already short, don't summarize
-	if len(content) < 600 {
-		return content, nil
-	}
-
-	prompt := fmt.Sprintf(`Resuma esta documentação técnica em 3-5 frases concisas. Extraia apenas os fatos principais, passos e detalhes técnicos. Remova instruções de UI, elementos de navegação e formatação. Foque no QUE e COMO, não ONDE clicar. IMPORTANTE: Mantenha o idioma original do conteúdo (se o conteúdo está em português, o resumo deve estar em português).
-
-Conteúdo:
-%s
-
-Resumo (máximo 500 caracteres):`, content)
-
-	chatReq := OllamaChatRequest{
-		Model: s.chatModel,
-		Messages: []ChatMessage{
-			{Role: "user", Content: prompt},
-		},
-		Stream: false,
-	}
-
-	reqBody, err := json.Marshal(chatReq)
-	if err != nil {
-		// Fallback: truncate
-		if len(content) > 800 {
-			return content[:800], nil
-		}
-		return content, nil
-	}
-
-	resp, err := http.Post(s.ollamaHost+"/api/chat", "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		// Fallback: truncate
-		if len(content) > 800 {
-			return content[:800], nil
-		}
-		return content, nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// Fallback: truncate
-		if len(content) > 800 {
-			return content[:800], nil
-		}
-		return content, nil
-	}
-
-	var chatResp OllamaChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		// Fallback: truncate
-		if len(content) > 800 {
-			return content[:800], nil
-		}
-		return content, nil
-	}
-
-	summary := strings.TrimSpace(chatResp.Message.Content)
-	// If summary is too long or empty, truncate original
-	if len(summary) == 0 || len(summary) > 850 {
-		if len(content) > 800 {
-			return content[:800], nil
-		}
-		return content, nil
-	}
-	return summary, nil
-}
-
-// IndexDocumentation indexes all markdown files in a directory
+// IndexDocumentation indexes all markdown files in a directory using parallel workers.
+// No LLM summarization is performed — original text is embedded directly for better
+// semantic fidelity and dramatically faster indexing.
 func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 	log.Printf("Finding markdown files in %s...\n", docsDir)
 
@@ -224,116 +259,77 @@ func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 		}
 		return nil
 	})
-
 	if err != nil {
 		log.Fatalf("Failed to walk documentation directory: %v", err)
 	}
 
-	log.Printf("Found %d markdown files. Starting indexing...\n", len(mdFiles))
+	log.Printf("Found %d markdown files. Starting parallel indexing (4 workers)...\n", len(mdFiles))
 
-	indexed := 0
-	failed := 0
-	skipped := 0
+	type result struct {
+		indexed int
+		failed  int
+		skipped int
+	}
 
-	for i, filePath := range mdFiles {
-		if i%100 == 0 && i > 0 {
-			log.Printf("Progress: %d/%d files (indexed: %d, failed: %d, skipped: %d)",
-				i, len(mdFiles), indexed, failed, skipped)
-		}
+	jobs := make(chan string, len(mdFiles))
+	results := make(chan result, len(mdFiles))
 
-		// Get relative path for storage first
-		relPath, _ := filepath.Rel(docsDir, filePath)
+	worker := func() {
+		for filePath := range jobs {
+			relPath, _ := filepath.Rel(docsDir, filePath)
 
-		// Check if file is already indexed (skip if so)
-		alreadyIndexed, err := s.repo.IsFileIndexed(ctx, relPath)
-		if err != nil {
-			log.Printf("Failed to check if %s is indexed: %v", relPath, err)
-			// Continue anyway, let ON CONFLICT handle it
-		} else if alreadyIndexed {
-			skipped++
-			continue
-		}
-
-		content, err := os.ReadFile(filePath)
-		if err != nil {
-			log.Printf("Failed to read %s: %v", filePath, err)
-			failed++
-			continue
-		}
-
-		contentStr := SanitizeUTF8(string(content))
-
-		// Skip empty files
-		if len(strings.TrimSpace(contentStr)) == 0 {
-			skipped++
-			continue
-		}
-
-		// Clean and chunk the content
-		cleanedContent := CleanMarkdown(contentStr)
-		chunks := ChunkByHeaders(cleanedContent, 2000) // Allow larger chunks, will summarize
-
-		if len(chunks) == 0 {
-			skipped++
-			continue
-		}
-
-		// Index each chunk separately
-		chunkIdx := 0
-		for _, chunk := range chunks {
-			chunk = strings.TrimSpace(chunk)
-			if len(chunk) < 50 { // Skip tiny chunks
-				skipped++
+			already, err := s.repo.IsFileIndexed(ctx, relPath)
+			if err == nil && already {
+				results <- result{skipped: 1}
 				continue
 			}
 
-			// First, try to summarize if the chunk is large
-			// This usually condenses 2000 chars → 400-500 chars, fitting in one embedding
-			processedChunk := chunk
-			if len(chunk) > 500 {
-				summarized, err := s.SummarizeWithLLM(chunk)
-				if err == nil && len(summarized) > 0 && len(summarized) < len(chunk) {
-					processedChunk = summarized
-					log.Printf("✂️  Summarized %s chunk %d: %d → %d chars", relPath, chunkIdx, len(chunk), len(summarized))
-				} else if err != nil {
-					log.Printf("⚠️  Summarization failed for %s chunk %d (len=%d), will split instead", relPath, chunkIdx, len(chunk))
-				}
+			content, err := os.ReadFile(filePath)
+			if err != nil {
+				log.Printf("Failed to read %s: %v", relPath, err)
+				results <- result{failed: 1}
+				continue
 			}
 
-			// Only split if summarization failed OR result is still too large
-			// Most summarized chunks (~400 chars) won't need splitting
-			maxChunkSize := 512
-			overlap := 100
-			subChunks := splitIntoSubChunks(processedChunk, maxChunkSize, overlap)
-
-			if len(subChunks) > 1 {
-				log.Printf("📦 Split %s chunk %d (%d chars) into %d sub-chunks", relPath, chunkIdx, len(processedChunk), len(subChunks))
+			contentStr := SanitizeUTF8(string(content))
+			if len(strings.TrimSpace(contentStr)) == 0 {
+				results <- result{skipped: 1}
+				continue
 			}
 
-			// Index each sub-chunk (usually just 1 if summarization worked)
-			for subIdx, subChunk := range subChunks {
-				subChunk = strings.TrimSpace(subChunk)
-				if len(subChunk) < 30 {
+			// nomic-embed-text supports up to 8192 tokens; use larger chunks
+			// to preserve more context per embedding.
+			cleanedContent := CleanMarkdown(contentStr)
+			chunks := ChunkByHeaders(cleanedContent, 1500)
+
+			if len(chunks) == 0 {
+				results <- result{skipped: 1}
+				continue
+			}
+
+			var indexed, failed, skipped int
+			chunkIdx := 0
+			title := filePathToTitle(relPath)
+			for _, chunk := range chunks {
+				chunk = strings.TrimSpace(SanitizeUTF8(chunk))
+				if len(chunk) < 50 {
 					skipped++
 					continue
 				}
 
-				// Sanitize UTF-8 before embedding and inserting
-				subChunk = SanitizeUTF8(subChunk)
-
-				embedding, err := s.GetEmbedding(subChunk)
+				// Title-enriched embed text: the embedding captures both document topic
+				// (from title) and local content. The stored content is just the chunk
+				// so the LLM receives clean, unmodified text.
+				embedText := title + "\n" + chunk
+				embedding, err := s.GetEmbedding(embedText)
 				if err != nil {
-					log.Printf("⚠️  Embedding failed for %s chunk %d.%d (len=%d): %v", relPath, chunkIdx, subIdx, len(subChunk), err)
-					if strings.Contains(err.Error(), "context length") {
-						skipped++
-					} else {
-						failed++
-					}
+					log.Printf("⚠️  Embedding failed for %s chunk %d: %v", relPath, chunkIdx, err)
+					failed++
 					continue
 				}
 
-				if err := s.repo.InsertDocument(ctx, relPath, chunkIdx, subChunk, embedding); err != nil {
-					log.Printf("Failed to insert %s chunk %d.%d: %v", relPath, chunkIdx, subIdx, err)
+				if err := s.repo.InsertDocument(ctx, relPath, chunkIdx, chunk, embedding); err != nil {
+					log.Printf("Failed to insert %s chunk %d: %v", relPath, chunkIdx, err)
 					failed++
 					continue
 				}
@@ -341,13 +337,33 @@ func (s *Service) IndexDocumentation(ctx context.Context, docsDir string) {
 				indexed++
 				chunkIdx++
 			}
+			results <- result{indexed: indexed, failed: failed, skipped: skipped}
 		}
 	}
 
+	// Start 4 parallel workers
+	numWorkers := 4
+	for range numWorkers {
+		go worker()
+	}
+
+	for _, f := range mdFiles {
+		jobs <- f
+	}
+	close(jobs)
+
+	totalIndexed, totalFailed, totalSkipped := 0, 0, 0
+	for range mdFiles {
+		r := <-results
+		totalIndexed += r.indexed
+		totalFailed += r.failed
+		totalSkipped += r.skipped
+	}
+
 	log.Printf("\n✅ Indexing complete!")
-	log.Printf("  Successfully indexed: %d chunks", indexed)
-	log.Printf("  Failed: %d chunks", failed)
-	log.Printf("  Skipped: %d chunks", skipped)
+	log.Printf("  Successfully indexed: %d chunks", totalIndexed)
+	log.Printf("  Failed: %d chunks", totalFailed)
+	log.Printf("  Skipped: %d chunks", totalSkipped)
 	log.Printf("  Total files: %d", len(mdFiles))
 }
 
@@ -453,6 +469,7 @@ func CleanMarkdown(content string) string {
 	// Remove image references: ![alt](path) and ![](path)
 	result := strings.Join(cleaned, "\n")
 	result = removeImageReferences(result)
+	result = stripHyperlinkURLs(result)
 
 	return strings.TrimSpace(result)
 }
@@ -465,7 +482,6 @@ func removeImageReferences(content string) string {
 		if start == -1 {
 			break
 		}
-		// Find the closing )
 		end := strings.Index(content[start:], ")")
 		if end == -1 {
 			break
@@ -473,6 +489,47 @@ func removeImageReferences(content string) string {
 		content = content[:start] + content[start+end+1:]
 	}
 	return content
+}
+
+// stripHyperlinkURLs converts [text](url) → text, removing noisy URLs from
+// embedded/LLM context while preserving the human-readable anchor text.
+func stripHyperlinkURLs(content string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(content) {
+		if content[i] != '[' {
+			result.WriteByte(content[i])
+			i++
+			continue
+		}
+		// Find the matching ]
+		bracketEnd := strings.Index(content[i+1:], "]")
+		if bracketEnd == -1 {
+			result.WriteByte(content[i])
+			i++
+			continue
+		}
+		bracketEnd = i + 1 + bracketEnd // absolute index of ]
+		afterBracket := bracketEnd + 1
+		// Must be followed by (url)
+		if afterBracket >= len(content) || content[afterBracket] != '(' {
+			result.WriteByte(content[i])
+			i++
+			continue
+		}
+		parenEnd := strings.Index(content[afterBracket+1:], ")")
+		if parenEnd == -1 {
+			result.WriteByte(content[i])
+			i++
+			continue
+		}
+		parenEnd = afterBracket + 1 + parenEnd // absolute index of )
+		// Write anchor text only, skip the URL
+		anchorText := content[i+1 : bracketEnd]
+		result.WriteString(anchorText)
+		i = parenEnd + 1
+	}
+	return result.String()
 }
 
 // ChunkByHeaders splits content into chunks based on headers
@@ -510,31 +567,6 @@ func ChunkByHeaders(content string, maxChunkSize int) []string {
 	// Don't forget the last chunk
 	if len(currentChunk) > 0 {
 		chunks = append(chunks, strings.Join(currentChunk, "\n"))
-	}
-
-	return chunks
-}
-
-// splitIntoSubChunks splits a string into smaller chunks with overlap
-func splitIntoSubChunks(text string, maxSize int, overlap int) []string {
-	if len(text) <= maxSize {
-		return []string{text}
-	}
-
-	var chunks []string
-	step := maxSize - overlap
-
-	for i := 0; i < len(text); i += step {
-		end := i + maxSize
-		if end > len(text) {
-			end = len(text)
-		}
-		chunks = append(chunks, text[i:end])
-
-		// If this chunk reaches the end, we're done
-		if end == len(text) {
-			break
-		}
 	}
 
 	return chunks

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // APIServer handles HTTP requests
@@ -40,64 +41,82 @@ func (s *APIServer) HandleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Limit == 0 {
-		req.Limit = 3
+		req.Limit = 5
 	}
 
 	ctx := r.Context()
 
-	// Get embedding for the query
-	queryEmbedding, err := s.service.GetEmbedding(req.Query)
+	// HyDE: generate a hypothetical document fragment to improve the query embedding.
+	// A plausible answer embeds closer to real documentation than a raw question does.
+	// NOTE: HyDE is used ONLY for the vector embedding, NOT for FTS — LLM hallucinations
+	// would introduce false vocabulary into FTS, biasing retrieval toward wrong documents.
+	searchText := req.Query
+	ftsText := req.Query
+	if hydeAnswer, err := s.service.GenerateHypotheticalAnswer(ctx, req.Query); err == nil && hydeAnswer != "" {
+		// Combine HyDE text with original query so both semantics are captured in the embedding
+		searchText = hydeAnswer + "\n" + req.Query
+		// FTS uses the raw user query — HyDE can hallucinate vocabulary not present in the corpus,
+		// which would introduce false FTS signals. Raw query uses the user's actual terminology.
+		ftsText = req.Query
+		log.Printf("HyDE expansion (%d chars): %s...", len(hydeAnswer), hydeAnswer[:min(len(hydeAnswer), 120)])
+	} else {
+		log.Printf("HyDE unavailable, using raw query: %v", err)
+	}
+
+	// Embed the (HyDE-expanded) search text
+	queryEmbedding, err := s.service.GetEmbedding(searchText)
 	if err != nil {
 		log.Printf("Failed to get query embedding: %v", err)
 		http.Error(w, "Failed to process query", http.StatusInternalServerError)
 		return
 	}
 
-	// Perform similarity search - gets best chunk per file
-	topFiles, err := s.repo.SimilaritySearch(ctx, queryEmbedding, req.Limit)
+	// Hybrid search: vector similarity + BM25 full-text, merged via Reciprocal Rank Fusion.
+	// Vector finds semantically similar chunks; FTS finds exact technical terms (DICOM, Orthanc, etc.).
+	topFiles, err := s.repo.HybridSearch(ctx, queryEmbedding, ftsText, req.Limit)
 	if err != nil {
 		log.Printf("Search failed: %v", err)
 		http.Error(w, "Search failed", http.StatusInternalServerError)
 		return
 	}
 
-	// For each top file, get all chunks to reconstruct the complete file
-	var completeFiles []Document
+	// For each matched file, retrieve a contiguous 3-chunk window centered on the best-matching
+	// chunk. Contiguous windows give the LLM coherent context (e.g., steps before/after a match)
+	// rather than scattered top-K chunks that may lack surrounding context.
+	var llmDocs []Document
 	var searchResults []SearchResult
 
 	for _, topFile := range topFiles {
-		// Get all chunks for this file
-		allChunks, err := s.repo.GetAllChunksForFile(ctx, topFile.FilePath)
+		window, err := s.repo.GetChunkWindow(ctx, topFile.FilePath, topFile.ChunkIndex, 3)
 		if err != nil {
-			log.Printf("Failed to get chunks for %s: %v", topFile.FilePath, err)
+			log.Printf("Failed to get chunk window for %s: %v", topFile.FilePath, err)
 			continue
 		}
 
-		// Reconstruct complete file by joining all chunks
-		var fullContent string
-		for _, chunk := range allChunks {
-			fullContent += chunk.Content + "\n\n"
+		// Combine window chunks into a single context block for the LLM
+		var parts []string
+		for _, c := range window {
+			parts = append(parts, c.Content)
 		}
-
-		// Add complete file for LLM context
-		completeFiles = append(completeFiles, Document{
+		llmDocs = append(llmDocs, Document{
 			FilePath: topFile.FilePath,
-			Content:  fullContent,
+			Content:  strings.Join(parts, "\n\n"),
+			Distance: topFile.Distance,
 		})
 
-		// Add to search results (with truncated content for display)
 		searchResults = append(searchResults, SearchResult{
 			FilePath:   topFile.FilePath,
-			ChunkIndex: 0, // Showing full file, not a specific chunk
-			Content:    Truncate(fullContent, 200),
+			ChunkIndex: topFile.ChunkIndex,
+			Content:    Truncate(strings.Join(parts, " "), 200),
+			Distance:   topFile.Distance,
 		})
 	}
 
-	// Generate answer using LLM with COMPLETE files as context
+	// Generate answer using LLM with the most relevant chunks as context
 	answer := ""
-	if len(completeFiles) > 0 {
+	if len(llmDocs) > 0 {
 		var err error
-		answer, err = s.service.GenerateAnswer(req.Query, completeFiles)
+		answer, err = s.service.GenerateAnswer(req.Query, llmDocs)
 		if err != nil {
 			log.Printf("Failed to generate answer: %v", err)
 			// Continue without answer rather than failing completely

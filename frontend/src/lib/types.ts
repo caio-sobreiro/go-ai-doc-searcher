@@ -2,6 +2,7 @@ export interface SearchResult {
 	file_path: string;
 	chunk_index: number;
 	content: string;
+	distance: number; // cosine distance: lower = more relevant
 }
 
 export interface SearchResponse {
