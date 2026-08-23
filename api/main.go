@@ -55,7 +55,15 @@ func main() {
 	}
 
 	// Initialize service
-	service := NewService(repo, cfg.OllamaHost, cfg.EmbeddingModel, cfg.ChatModel)
+	service := NewService(
+		repo,
+		cfg.OllamaHost,
+		cfg.EmbeddingModel,
+		cfg.ChatModel,
+		cfg.LLMBackend,
+		cfg.OpenRouterAPIKey,
+		cfg.OpenRouterModel,
+	)
 
 	// Index documentation on startup (in background)
 	var indexingDone sync.WaitGroup

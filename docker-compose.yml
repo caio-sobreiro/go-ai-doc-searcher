@@ -24,9 +24,14 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: vectordb
+
       OLLAMA_HOST: http://host.docker.internal:11434
       EMBEDDING_MODEL: nomic-embed-text
-      CHAT_MODEL: qwen3:14b
+
+      LLM_BACKEND: openrouter
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: openai/gpt-5.6-luna
+
       VECTOR_DIMENSIONS: 768
       API_PORT: 8080
     depends_on:

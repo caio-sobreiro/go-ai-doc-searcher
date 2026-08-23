@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -17,6 +18,9 @@ type Config struct {
 	OllamaHost       string
 	EmbeddingModel   string
 	ChatModel        string
+	LLMBackend       string
+	OpenRouterAPIKey string
+	OpenRouterModel  string
 	VectorDimensions string
 	APIPort          string
 	DocsDir          string
@@ -38,6 +42,9 @@ func LoadConfig() *Config {
 		OllamaHost:       getEnv("OLLAMA_HOST", "http://ollama:11434"),
 		EmbeddingModel:   getEnv("EMBEDDING_MODEL", "all-minilm"),
 		ChatModel:        getEnv("CHAT_MODEL", "llama3.2:3b"),
+		LLMBackend:       strings.ToLower(getEnv("LLM_BACKEND", "ollama")),
+		OpenRouterAPIKey: getEnv("OPENROUTER_API_KEY", ""),
+		OpenRouterModel:  getEnv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
 		VectorDimensions: getEnv("VECTOR_DIMENSIONS", "384"), // all-minilm uses 384 dimensions
 		APIPort:          getEnv("API_PORT", "8080"),
 		DocsDir:          getEnv("DOCS_DIR", "/app/documentation"),

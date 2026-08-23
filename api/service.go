@@ -21,10 +21,13 @@ import (
 
 // Service handles business logic
 type Service struct {
-	repo           *Repository
-	ollamaHost     string
-	embeddingModel string
-	chatModel      string
+	repo            *Repository
+	ollamaHost      string
+	embeddingModel  string
+	chatModel       string
+	llmBackend      string
+	openRouterKey   string
+	openRouterModel string
 }
 
 // SanitizeUTF8 removes invalid UTF-8 sequences from a string
@@ -48,13 +51,128 @@ func SanitizeUTF8(s string) string {
 }
 
 // NewService creates a new Service instance
-func NewService(repo *Repository, ollamaHost, embeddingModel, chatModel string) *Service {
+func NewService(repo *Repository, ollamaHost, embeddingModel, chatModel, llmBackend, openRouterKey, openRouterModel string) *Service {
 	return &Service{
-		repo:           repo,
-		ollamaHost:     ollamaHost,
-		embeddingModel: embeddingModel,
-		chatModel:      chatModel,
+		repo:            repo,
+		ollamaHost:      ollamaHost,
+		embeddingModel:  embeddingModel,
+		chatModel:       chatModel,
+		llmBackend:      strings.ToLower(strings.TrimSpace(llmBackend)),
+		openRouterKey:   strings.TrimSpace(openRouterKey),
+		openRouterModel: strings.TrimSpace(openRouterModel),
 	}
+}
+
+type OpenRouterChatRequest struct {
+	Model       string        `json:"model"`
+	Messages    []ChatMessage `json:"messages"`
+	Temperature float64       `json:"temperature,omitempty"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+}
+
+type OpenRouterChatResponse struct {
+	Choices []struct {
+		Message ChatMessage `json:"message"`
+	} `json:"choices"`
+}
+
+func (s *Service) generateChatCompletion(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int) (string, error) {
+	if s.llmBackend == "openrouter" {
+		return s.generateOpenRouterChatCompletion(ctx, messages, temperature, maxTokens)
+	}
+	return s.generateOllamaChatCompletion(ctx, messages, temperature, maxTokens)
+}
+
+func (s *Service) generateOllamaChatCompletion(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int) (string, error) {
+	chatReq := OllamaChatRequest{
+		Model:    s.chatModel,
+		Messages: messages,
+		Stream:   false,
+		Think:    false,
+		Options: map[string]any{
+			"temperature": temperature,
+			"num_predict": maxTokens,
+		},
+	}
+
+	reqBody, err := json.Marshal(chatReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal Ollama chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.ollamaHost+"/api/chat", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create Ollama request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call Ollama chat API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Ollama chat API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp OllamaChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("failed to decode Ollama chat response: %w", err)
+	}
+
+	return strings.TrimSpace(chatResp.Message.Content), nil
+}
+
+func (s *Service) generateOpenRouterChatCompletion(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int) (string, error) {
+	if s.openRouterKey == "" {
+		return "", fmt.Errorf("OPENROUTER_API_KEY is required when LLM_BACKEND=openrouter")
+	}
+	if s.openRouterModel == "" {
+		return "", fmt.Errorf("OPENROUTER_MODEL is required when LLM_BACKEND=openrouter")
+	}
+
+	chatReq := OpenRouterChatRequest{
+		Model:       s.openRouterModel,
+		Messages:    messages,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+	}
+
+	reqBody, err := json.Marshal(chatReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal OpenRouter chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create OpenRouter request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.openRouterKey)
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call OpenRouter chat API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("OpenRouter chat API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var chatResp OpenRouterChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("failed to decode OpenRouter chat response: %w", err)
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("OpenRouter returned no choices")
+	}
+
+	return strings.TrimSpace(chatResp.Choices[0].Message.Content), nil
 }
 
 // OllamaEmbedRequest is the payload for the newer /api/embed endpoint (works for all models)
@@ -146,43 +264,12 @@ Pergunta: %s
 
 Trecho hipotético:`, query)
 
-	chatReq := OllamaChatRequest{
-		Model:    s.chatModel,
-		Messages: []ChatMessage{{Role: "user", Content: prompt}},
-		Stream:   false,
-		Think:    false,
-		Options:  map[string]any{"num_predict": 150},
-	}
-
-	reqBody, err := json.Marshal(chatReq)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.ollamaHost+"/api/chat", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("ollama API error %d: %s", resp.StatusCode, string(body))
-	}
-
-	var chatResp OllamaChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(chatResp.Message.Content), nil
+	return s.generateChatCompletion(
+		ctx,
+		[]ChatMessage{{Role: "user", Content: prompt}},
+		0.2,
+		150,
+	)
 }
 
 // GenerateAnswer generates an answer using the LLM based on retrieved chunks
@@ -192,7 +279,7 @@ func (s *Service) GenerateAnswer(query string, results []Document) (string, erro
 	for i, result := range results {
 		contextParts = append(contextParts, fmt.Sprintf("[Fonte %d: %s]\n%s", i+1, result.FilePath, result.Content))
 	}
-	context := strings.Join(contextParts, "\n\n---\n\n")
+	contextText := strings.Join(contextParts, "\n\n---\n\n")
 
 	systemPrompt := `Você é um assistente que responde perguntas técnicas SOMENTE com base nos documentos fornecidos.
 
@@ -204,43 +291,17 @@ PROCESSO OBRIGATÓRIO:
 
 PROIBIDO: inventar procedimentos, usar conhecimento geral, inferir etapas não documentadas.`
 
-	userPrompt := fmt.Sprintf("Documentos:\n%s\n\n---\nPergunta: %s\n\nResposta (baseada EXCLUSIVAMENTE nos documentos acima):", context, query)
+	userPrompt := fmt.Sprintf("Documentos:\n%s\n\n---\nPergunta: %s\n\nResposta (baseada EXCLUSIVAMENTE nos documentos acima):", contextText, query)
 
-	// Call Ollama chat API with think:false to suppress qwen3 reasoning tokens.
-	// temperature:0 reduces creativity and hallucination — we want grounded answers.
-	chatReq := OllamaChatRequest{
-		Model: s.chatModel,
-		Messages: []ChatMessage{
+	return s.generateChatCompletion(
+		context.Background(),
+		[]ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
-		Stream:  false,
-		Think:   false,
-		Options: map[string]any{"temperature": 0.0, "num_predict": 800},
-	}
-
-	reqBody, err := json.Marshal(chatReq)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal chat request: %w", err)
-	}
-
-	resp, err := http.Post(s.ollamaHost+"/api/chat", "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to call Ollama chat API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Ollama chat API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var chatResp OllamaChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", fmt.Errorf("failed to decode chat response: %w", err)
-	}
-
-	return chatResp.Message.Content, nil
+		0.0,
+		800,
+	)
 }
 
 // IndexDocumentation indexes all markdown files in a directory using parallel workers.
